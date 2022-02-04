@@ -1,0 +1,6 @@
+{
+  "id": "optional-locales-validation",
+  "name": "optional-locales-validation",
+  "srcdoc": "./build/index.html",
+  "sidebar": true
+}
