@@ -1,68 +1,269 @@
+// A lot of functionality derived and adapted from:
+// https://github.com/contentful/extensions/blob/master/samples/publish-confirm/src/index.js
+
 import * as React from 'react';
 import { render } from 'react-dom';
-import { Button } from '@contentful/forma-36-react-components';
+import { Button, Paragraph, TextLink } from '@contentful/forma-36-react-components';
 import {
   init,
   locations,
-  DialogExtensionSDK,
-  SidebarExtensionSDK
+  SidebarExtensionSDK,
+  ContentType,
 } from 'contentful-ui-extensions-sdk';
-import tokens from '@contentful/forma-36-tokens';
+import { Entry } from 'contentful-management/dist/typings/entities/entry';
 import '@contentful/forma-36-react-components/dist/styles.css';
 import './index.css';
+import relativeDate from 'relative-date'
 
-export class DialogExtension extends React.Component<{
-  sdk: DialogExtensionSDK;
-}> {
-  render() {
-    return (
-      <div style={{ margin: tokens.spacingM }}>
-        <Button
-          testId="close-dialog"
-          buttonType="muted"
-          onClick={() => {
-            this.props.sdk.close('data from modal dialog');
-          }}>
-          Close modal
-        </Button>
-      </div>
-    );
-  }
+interface IState {
+  working: boolean;
+  isDraft: boolean;
+  hasPendingChanges: boolean;
+  isPublished: boolean;
+  displayFieldsMap: {};
 }
 
-export class SidebarExtension extends React.Component<{
-  sdk: SidebarExtensionSDK;
-}> {
+export class SidebarExtension extends React.Component<
+  {
+    sdk: SidebarExtensionSDK;
+  },
+  IState
+> {
+  detachFns: any[];
+  constructor(props) {
+    super(props);
+
+    this.state = this.constructState();
+  }
+
   componentDidMount() {
+    this.detachFns = [];
+
+    const fields = this.props.sdk.entry.fields;
+
+    for (const key in fields) {
+      this.detachFns.push(fields[key].onValueChanged(this.onUpdate));
+    }
+
+    this.props.sdk.space.getContentTypes<ContentType>().then((allContentTypes) => {
+      const displayFieldsMap = {};
+      for (const ct of allContentTypes.items) {
+        displayFieldsMap[ct.sys.id] = ct.displayField;
+      }
+
+      this.setState({
+        displayFieldsMap,
+      });
+    });
+
+    this.detachFns.push(this.props.sdk.entry.onSysChanged(this.onUpdate));
     this.props.sdk.window.startAutoResizer();
   }
+
+  componentWillUnmount = () => {
+    this.detachFns.forEach((detach) => detach());
+  };
+
+  constructState = () => {
+    const sys = this.props.sdk.entry.getSys();
+
+    return {
+      working: false,
+      isDraft: !sys.publishedVersion,
+      hasPendingChanges: sys.version > (sys.publishedVersion || 0) + 1,
+      isPublished: sys.version === (sys.publishedVersion || 0) + 1,
+      displayFieldsMap: {},
+    };
+  };
+
+  onError = (error) => {
+    this.setState({ working: false });
+    this.props.sdk.notifier.error(error.message);
+  };
 
   onButtonClick = async () => {
     const result = await this.props.sdk.dialogs.openExtension({
       width: 800,
-      title: 'The same extension rendered in modal window'
+      title: 'The same extension rendered in modal window',
     });
     // eslint-disable-next-line no-console
     console.log(result);
   };
 
-  render() {
+  onUpdate = () => {
+    this.setState(this.constructState());
+  };
+
+  unpublishedReferences = (entry) => {
+    const referenceFieldNames = [];
+    const entryReferenceIds = [];
+
+    for (const name in entry.fields) {
+      const locale = this.props.sdk.locales.default;
+      if (
+        entry.fields[name][locale].sys &&
+        entry.fields[name][locale].sys.type === 'Link' &&
+        entry.fields[name][locale].sys.linkType === 'Entry'
+      ) {
+        referenceFieldNames.push(name);
+        entryReferenceIds.push(entry.fields[name][locale].sys.id);
+      }
+    }
+
+    return this.props.sdk.space
+      .getEntries<Entry>({
+        'sys.id[in]': entryReferenceIds.join(','),
+      })
+      .then((referenceEntries) => {
+        return referenceEntries.items
+          .filter((entry) => !entry.sys.publishedVersion)
+          .map((entry, index) => ({
+            field: referenceFieldNames[index],
+            entry,
+          }));
+      });
+  };
+
+  getLinkedAndPublishedEntries = (entry) => {
+    return this.props.sdk.space
+      .getEntries<Entry>({
+        links_to_entry: entry.sys.id,
+      })
+      .then((linkedEntries) => linkedEntries.items.filter((entry) => !!entry.sys.publishedVersion));
+  };
+
+  getEntryDisplayFieldValue = (entry) => {
+    const displayField = this.state.displayFieldsMap[entry.sys.contentType.sys.id];
+
+    return displayField ? entry.fields[displayField][this.props.sdk.locales.default] : entry.sys.id;
+  };
+
+  onClickUnpublish = async () => {
+    this.setState({ working: true });
+
+    const sdk = this.props.sdk;
+    const sys = sdk.entry.getSys();
+
+    const entry = await sdk.space.getEntry<Entry>(sys.id);
+
+    const linkedAndPublishedEntries = await this.getLinkedAndPublishedEntries(entry);
+
+    let title = 'Unpublish entry?';
+    let message = 'This entry will be unpublished';
+
+    let confirmLabel = 'Unpublish';
+    if (linkedAndPublishedEntries.length > 0) {
+      title = 'Entry is linked in other entries';
+      confirmLabel = 'Unpublish anyway';
+      message =
+        `There are ${linkedAndPublishedEntries.length} entries that link to this entry: ` +
+        linkedAndPublishedEntries.map(this.getEntryDisplayFieldValue).join(', ');
+    }
+
+    const result = await this.props.sdk.dialogs.openConfirm({
+      title,
+      message,
+      confirmLabel,
+      cancelLabel: 'Cancel',
+    });
+
+    if (!result) {
+      this.setState({ working: false });
+      return;
+    }
+
+    try {
+      await sdk.space.unpublishEntry(entry);
+      this.onUpdate();
+    } catch (error) {
+      this.onError(error);
+    }
+  };
+
+  onClickPublish = async () => {
+    this.setState({ working: true });
+
+    const sdk = this.props.sdk;
+    const sys = sdk.entry.getSys();
+
+    const entry = await sdk.space.getEntry(sys.id);
+    const unpublishedReferences = await this.unpublishedReferences(entry);
+
+    let title = 'Publish entry?';
+    let message = 'This entry will be published.';
+    let confirmLabel = 'Publish';
+
+    if (unpublishedReferences.length > 0) {
+      title = 'You have unpublished links';
+      message =
+        'Not all links on this entry are published. See sections: ' +
+        unpublishedReferences.map((ref) => ref.field).join(', ');
+      confirmLabel = 'Publish anyway';
+    }
+
+    const result = await this.props.sdk.dialogs.openConfirm({
+      title,
+      message,
+      confirmLabel,
+      cancelLabel: 'Cancel',
+    });
+
+    if (!result) {
+      this.setState({ working: false });
+      return;
+    }
+
+    try {
+      await sdk.space.publishEntry(entry);
+      this.onUpdate();
+    } catch (error) {
+      this.onError(error);
+    }
+  };
+
+  renderStatusLabel = () => {
+    if (this.state.isPublished) {
+      return 'Published';
+    }
+
+    if (this.state.isDraft) {
+      return 'Draft';
+    }
+
+    return 'Published (pending changes)';
+  };
+
+  render = () => {
+    const ago = relativeDate(new Date(this.props.sdk.entry.getSys().updatedAt));
+
     return (
-      <Button
-        testId="open-dialog"
-        buttonType="positive"
-        isFullWidth={true}
-        onClick={this.onButtonClick}>
-        Click on me to open dialog extension
-      </Button>
+      <>
+        <Paragraph className="f36-margin-bottom--s">
+          <strong>Status: </strong>
+          {this.renderStatusLabel()}
+        </Paragraph>
+        <Button
+          className="publish-button"
+          buttonType="positive"
+          isFullWidth={true}
+          onClick={this.onClickPublish}
+          disabled={this.state.isPublished || this.state.working}
+          loading={this.state.working}>
+          Publish
+        </Button>
+        <TextLink
+          className="f36-margin-top--s f36-margin-bottom--xs"
+          onClick={this.onClickUnpublish}>
+          Unpublish
+        </TextLink>
+        <Paragraph>Last saved {ago}</Paragraph>
+      </>
     );
-  }
+  };
 }
 
-init(sdk => {
-  if (sdk.location.is(locations.LOCATION_DIALOG)) {
-    render(<DialogExtension sdk={sdk as DialogExtensionSDK} />, document.getElementById('root'));
-  } else {
+init((sdk) => {
+  if (!sdk.location.is(locations.LOCATION_DIALOG)) {
     render(<SidebarExtension sdk={sdk as SidebarExtensionSDK} />, document.getElementById('root'));
   }
 });
