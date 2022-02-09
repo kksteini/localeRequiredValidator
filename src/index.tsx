@@ -180,6 +180,34 @@ export class SidebarExtension extends React.Component<
     }
   };
 
+  // Returns empty array if all required fields of the non-default locale are filled in
+  // Otherwise, returns an array of the field names
+  // Why? Because of the setting which enables content editors to publish empty
+  getInvalidOptionalLocales = (): string[] => {
+    const invalidRequiredFields = []
+    const sdk = this.props.sdk
+
+    for(const locale of sdk.locales.available) {
+      const localeInvalidFields = []
+      let localeAny = false
+      for(const field of Object.keys(sdk.entry.fields)) {
+        if(sdk.entry.fields[field].locales.includes(locale)) {
+          const value = sdk.entry.fields[field].getForLocale(locale).getValue()
+          if(sdk.entry.fields[field].required && !value) {
+            localeInvalidFields.push(`${locale}: ${field}`)
+          } else if(value) {
+            localeAny = true
+          }
+        }
+      }
+
+      if(localeAny) {
+        invalidRequiredFields.push(...localeInvalidFields)
+      }
+    }
+    return invalidRequiredFields
+  }
+
   onClickPublish = async () => {
     this.setState({ working: true });
 
@@ -188,6 +216,7 @@ export class SidebarExtension extends React.Component<
 
     const entry = await sdk.space.getEntry(sys.id);
     const unpublishedReferences = await this.unpublishedReferences(entry);
+    const invalidOptionalLocales = this.getInvalidOptionalLocales()
 
     let title = 'Publish entry?';
     let message = 'This entry will be published.';
@@ -199,6 +228,21 @@ export class SidebarExtension extends React.Component<
         'Not all links on this entry are published. See sections: ' +
         unpublishedReferences.map((ref) => ref.field).join(', ');
       confirmLabel = 'Publish anyway';
+    }
+
+    if (invalidOptionalLocales.length > 0) {
+      title = 'Some required fields are not met'
+      message =
+        `If you only intend to publish ${sdk.locales.default}, please make sure that all fields of the other locale/s are empty. 
+        Required fields are not met in the following: ${invalidOptionalLocales.join(', ')}.`
+      confirmLabel = 'Understood'
+      await this.props.sdk.dialogs.openAlert({
+        title,
+        message,
+        confirmLabel
+      })
+      this.setState({ working: false })
+      return
     }
 
     const result = await this.props.sdk.dialogs.openConfirm({
